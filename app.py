@@ -4,13 +4,11 @@ import altair as alt
 from datetime import date, timedelta, datetime
 import calendar
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import ProgrammingError, OperationalError
 
 # ==========================================
 # 1. 설정 및 DB 연결
 # ==========================================
-# [중요] 아까 성공한 Supabase 주소 (포트 6543) 그대로 유지!
-# 혹시 모르니 st.secrets를 쓰거나, 직접 주소를 넣어줘.
 try:
     DB_URL = st.secrets["db_url"]
 except:
@@ -69,7 +67,7 @@ def get_engine():
 def init_db():
     engine = get_engine()
     with engine.connect() as conn:
-        # items 테이블 생성 (target_area 컬럼 추가됨)
+        # 테이블 생성
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS items (
                 id SERIAL PRIMARY KEY,
@@ -83,12 +81,13 @@ def init_db():
             )
         """))
         
-        # [자동 마이그레이션] 기존에 테이블이 있는데 target_area 컬럼이 없으면 추가
+        # [수정] IF NOT EXISTS 문법을 사용하여 에러 방지
         try:
-            conn.execute(text("ALTER TABLE items ADD COLUMN target_area TEXT DEFAULT 'ALL'"))
+            conn.execute(text("ALTER TABLE items ADD COLUMN IF NOT EXISTS target_area TEXT DEFAULT 'ALL'"))
             conn.commit()
-        except OperationalError:
-            pass # 이미 있으면 패스
+        except Exception:
+            # 혹시라도 에러나면 무시 (이미 있을 확률 100%)
+            pass
 
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -326,7 +325,6 @@ def page_items():
     with tab1:
         df = get_items_df()
         if df is not None and not df.empty:
-            # 화면용 변환
             df_disp = df.copy()
             df_disp["target_area"] = df_disp["target_area"].map(AREA_OPTS).fillna(df_disp["target_area"])
             st.dataframe(safe_display(df_disp), use_container_width=True)
@@ -341,7 +339,6 @@ def page_items():
                 with st.form("edit_item"):
                     c1, c2 = st.columns(2)
                     n = c1.text_input(t("item_name"), row["name"])
-                    # [수정] 구역 선택 추가
                     curr_area = row["target_area"] if row["target_area"] in AREA_OPTS else "ALL"
                     area_key = c1.selectbox(t("item_cat"), list(AREA_OPTS.keys()), index=list(AREA_OPTS.keys()).index(curr_area), format_func=lambda x: AREA_OPTS[x])
                     
@@ -437,10 +434,8 @@ def page_forecast_general():
     stock = get_latest_stock_df()
     if stock is None or stock.empty: return
 
-    # 가동률 설정 (기본값: 태홍이가 준 데이터)
     with st.expander("⚙️ 稼働率設定 (Occupancy Settings)", expanded=True):
         c1, c2, c3 = st.columns(3)
-        # 기준 가동률(Reference) 대비 현재 예상 가동률(Target)로 소비량 조절
         occ_all = c1.slider("全客室 (Default 90%)", 0, 100, 90)
         occ_std = c2.slider("Standard (Default 93%)", 0, 100, 93)
         occ_hak = c3.slider("Hakata (Default 70%)", 0, 100, 70)
@@ -463,14 +458,9 @@ def page_forecast_general():
     else:
         merged["incoming_units"] = 0.0
 
-    # [핵심 로직] 구역별 가동률 보정
-    # 평소(기준) 가동률 대비 현재 슬라이더 값의 비율로 소비량을 예측
     def apply_occupancy_rate(row):
         base_usage = float(row["daily_avg_usage"])
         area = row.get("target_area", "ALL")
-        
-        # 기준 가동률 (평소 이정도 찬다고 가정했을 때의 데이터가 daily_avg_usage에 쌓여있다고 가정)
-        # 만약 데이터가 충분치 않으면 그냥 1.0(100%)으로 보정
         ref_occ = 90.0 
         target_occ = occ_all
 
@@ -481,17 +471,13 @@ def page_forecast_general():
             ref_occ = 70.0
             target_occ = occ_hak
         
-        # 보정 계수: (예측 가동률 / 평소 가동률)
-        # 예: 평소 90%인데 이번달 45% 예상 -> 소비량 절반으로 예측
         factor = target_occ / ref_occ if ref_occ > 0 else 1.0
         return base_usage * factor
 
     merged["simulated_usage"] = merged.apply(apply_occupancy_rate, axis=1)
     merged["forecast"] = merged["simulated_usage"] * hor
-    
     merged["order"] = (merged["forecast"] + merged["safety_stock"] - merged["current_stock"] - merged["incoming_units"]).apply(lambda x: x if x > 0 else 0)
     
-    # 보여줄 컬럼 정리
     res_display = merged[["name", "target_area", "current_stock", "incoming_units", "forecast", "safety_stock", "order"]].sort_values("order", ascending=False)
     st.dataframe(safe_display(res_display), use_container_width=True)
 
