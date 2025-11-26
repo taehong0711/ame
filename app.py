@@ -276,6 +276,7 @@ def get_jp_holiday_name(dt: date):
 def page_home():
     st.header(t("menu_home"))
     stock_df = get_latest_stock_df()
+    
     if stock_df is None or stock_df.empty:
         st.info(t("warn_no_data"))
         return
@@ -298,53 +299,32 @@ def page_home():
     else:
         merged["incoming_units"] = 0.0
     
-    # ==========================================
-    # [NEW] 예측 로직: 실제 사용량(Actual) vs 이론 사용량(Theory)
-    # ==========================================
-    
-    # 1. 기본 가동률 설정 (태홍이네 호텔 기준)
+    # --- [가동률 기반 이론 사용량 계산] ---
     ROOMS_ALL = 238
     ROOMS_STD = 225
     ROOMS_HAK = 13
     
-    OCC_ALL = 0.90 # 90%
-    OCC_STD = 0.93 # 93%
-    OCC_HAK = 0.70 # 70%
+    # 홈 화면에서는 기본값(90%, 93%, 70%)으로 계산해서 보여줌
+    OCC_ALL = 0.90
+    OCC_STD = 0.93
+    OCC_HAK = 0.70
 
     def calculate_theory_daily(row):
         area = row.get("target_area", "ALL")
-        upr = float(row.get("units_per_room", 0.0)) # 1방당 몇개?
+        upr = float(row.get("units_per_room", 0.0))
+        if upr <= 0: return 0.0
         
-        if upr <= 0: return 0.0 # 설정 안했으면 계산 불가
-        
-        rooms = ROOMS_ALL
-        occ = OCC_ALL
-        
-        if area == "STD":
-            rooms = ROOMS_STD
-            occ = OCC_STD
-        elif area == "HAK":
-            rooms = ROOMS_HAK
-            occ = OCC_HAK
-            
-        # 이론상 하루 소비량 = 방개수 * 가동률 * 방당개수
-        return rooms * occ * upr
+        if area == "STD": return ROOMS_STD * OCC_STD * upr
+        elif area == "HAK": return ROOMS_HAK * OCC_HAK * upr
+        else: return ROOMS_ALL * OCC_ALL * upr
 
     merged["theory_daily_usage"] = merged.apply(calculate_theory_daily, axis=1)
     
-    # 2. 최종 예측량 결정 (실제 vs 이론 중 더 큰 값 or 상황에 따라 선택)
-    # 여기서는 안전하게 '둘 중 더 큰 값'을 기준으로 잡거나, 
-    # 실제 데이터가 없으면 이론값을 쓰는 하이브리드 방식 채택
+    # [하이브리드] 실제 vs 이론 중 더 큰 값 채택 (안전재고 확보 차원)
     def decide_forecast_usage(row):
         actual = row["daily_avg_usage"]
         theory = row["theory_daily_usage"]
-        
-        # 실제 기록이 있으면 그걸 우선하되, 이론값이 터무니없이 크면(도난 등) 이론값 참고 가능
-        # 여기선 단순하게: 실제 데이터가 0이면 이론값, 아니면 실제값 사용 (또는 MAX 사용)
-        if actual > 0:
-            return actual
-        else:
-            return theory
+        return actual if actual > 0 else theory
 
     merged["final_daily_usage"] = merged.apply(decide_forecast_usage, axis=1)
     merged["forecast"] = merged["final_daily_usage"] * horizon
@@ -364,22 +344,42 @@ def page_home():
     st.divider()
     if not urgent.empty:
         st.subheader("🚨 Urgent Orders (Recommended)")
-        # 표시용 데이터 생성
-        urgent_display = urgent[["name", "target_area", "current_stock", "daily_avg_usage", "theory_daily_usage", "order_qty", "unit"]].copy()
         
-        # 컬럼명 보기 좋게 변경 (일본어)
+        # [NEW] CS 단위 변환 함수
+        def convert_to_cs_home(row):
+            units_needed = row["order_qty"]
+            cs_size = row.get("cs_total_units", 0)
+            unit_name = row.get("unit", "")
+
+            if units_needed <= 0: return "-"
+            
+            if cs_size > 0:
+                return f"{units_needed / cs_size:.1f} CS"
+            else:
+                return f"{int(units_needed)} {unit_name}"
+
+        # 변환 적용
+        urgent = urgent.copy() # 경고 방지용 복사
+        urgent["order_display"] = urgent.apply(convert_to_cs_home, axis=1)
+
+        # 표시할 컬럼 및 이름 변경
+        urgent_display = urgent[["name", "target_area", "current_stock", "daily_avg_usage", "theory_daily_usage", "order_display"]].copy()
         urgent_display = urgent_display.rename(columns={
-            "daily_avg_usage": "実績消費/日",
-            "theory_daily_usage": "理論消費/日"
+            "name": "品目名",
+            "target_area": "エリア",
+            "current_stock": "現在在庫",
+            "daily_avg_usage": "実績/日",
+            "theory_daily_usage": "理論/日",
+            "order_display": "発注推奨"
         })
         
-        # 소수점 정리
-        urgent_display["実績消費/日"] = urgent_display["実績消費/日"].apply(lambda x: round(x, 1))
-        urgent_display["理論消費/日"] = urgent_display["理論消費/日"].apply(lambda x: round(x, 1))
-        urgent_display["order_qty"] = urgent_display["order_qty"].apply(lambda x: int(x))
+        # 숫자 다듬기
+        urgent_display["実績/日"] = urgent_display["実績/日"].apply(lambda x: round(x, 1))
+        urgent_display["理論/日"] = urgent_display["理論/日"].apply(lambda x: round(x, 1))
+        urgent_display["現在在庫"] = urgent_display["現在在庫"].apply(lambda x: int(x))
 
-        st.dataframe(safe_display(urgent_display).style.background_gradient(cmap="Reds", subset=["order_qty"]), use_container_width=True)
-        st.caption("※ 実績消費: 過去の在庫記録に基づく平均 / 理論消費: 稼働率設定に基づく計算値")
+        st.dataframe(safe_display(urgent_display), use_container_width=True)
+        st.caption("※ 実績: 過去平均 / 理論: 基本稼働率(90%) / 発注推奨: 必要数を1CS入数で割った値")
     else:
         st.success("✅ All stocks are safe.")
 
@@ -724,4 +724,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
