@@ -508,9 +508,9 @@ def page_forecast_general():
     stock = get_latest_stock_df()
     if stock is None or stock.empty: return
 
+    # 1. 가동률 및 기간 설정
     with st.expander("⚙️ 稼働率設定 (Occupancy Settings)", expanded=True):
         c1, c2, c3 = st.columns(3)
-        # [태홍이 호텔 기준 가동률]
         occ_all = c1.slider("全客室 (Default 90%)", 0, 100, 90) / 100.0
         occ_std = c2.slider("Standard (Default 93%)", 0, 100, 93) / 100.0
         occ_hak = c3.slider("Hakata (Default 70%)", 0, 100, 70) / 100.0
@@ -519,6 +519,7 @@ def page_forecast_general():
         days = cc1.slider(t("days_label"), 7, 120, 60)
         hor = cc2.slider(t("horizon_label"), 7, 120, 30)
 
+    # 2. 데이터 계산 (지난번과 동일)
     usage = get_usage_from_snapshots(days)
     
     if not usage.empty:
@@ -533,60 +534,94 @@ def page_forecast_general():
     else:
         merged["incoming_units"] = 0.0
 
-    # [핵심 로직] 가동률 기반 시뮬레이션 (Theory Calculation)
-    ROOMS_ALL = 238
-    ROOMS_STD = 225
-    ROOMS_HAK = 13
-
-    def calculate_simulated_daily(row):
+    # 3. 이론 소비량 계산
+    def apply_occupancy_rate(row):
+        base_usage = float(row["daily_avg_usage"])
         area = row.get("target_area", "ALL")
-        upr = float(row.get("units_per_room", 0.0)) # 방당 개수
-        
-        # 설정 안 했으면 그냥 0 리턴
-        if upr <= 0: return 0.0
-        
-        # 이론 사용량 = 객실수 * 현재설정가동률 * 방당개수
-        if area == "STD":
-            return ROOMS_STD * occ_std * upr
-        elif area == "HAK":
-            return ROOMS_HAK * occ_hak * upr
-        else:
-            return ROOMS_ALL * occ_all * upr
+        ref_occ = 90.0 
+        target_occ = occ_all * 100 # slider value
 
-    merged["theory_usage"] = merged.apply(calculate_simulated_daily, axis=1)
-    
-    # [하이브리드] 실제 vs 이론 중 무엇을 쓸 것인가?
-    # -> 실제 데이터가 있으면 실제를 쓰고, 없으면 이론을 쓴다.
-    # -> (원한다면 MAX(실제, 이론)으로 바꿀 수도 있음)
-    def pick_usage(row):
-        actual = float(row["daily_avg_usage"])
-        theory = float(row["theory_usage"])
+        if area == "STD":
+            ref_occ = 93.0
+            target_occ = occ_std * 100
+        elif area == "HAK":
+            ref_occ = 70.0
+            target_occ = occ_hak * 100
         
-        # Case 1: 실제 데이터가 충분하면 실제 데이터가 짱임
-        if actual > 0: return actual
-        # Case 2: 실제 데이터 없으면(신상품 등) 이론치 사용
-        return theory
+        # 데이터가 없으면 0
+        if base_usage == 0: return 0.0
+        
+        factor = target_occ / ref_occ if ref_occ > 0 else 1.0
+        return base_usage * factor
+
+    # 이론치(방당 개수 기반) 계산 함수
+    ROOMS_ALL = 238; ROOMS_STD = 225; ROOMS_HAK = 13
+    def calculate_theory_daily(row):
+        area = row.get("target_area", "ALL")
+        upr = float(row.get("units_per_room", 0.0))
+        if upr <= 0: return 0.0
+        if area == "STD": return ROOMS_STD * occ_std * upr
+        elif area == "HAK": return ROOMS_HAK * occ_hak * upr
+        else: return ROOMS_ALL * occ_all * upr
+
+    merged["simulated_usage"] = merged.apply(apply_occupancy_rate, axis=1)
+    merged["theory_usage"] = merged.apply(calculate_theory_daily, axis=1)
+
+    # 하이브리드 선택 (실적 vs 이론)
+    def pick_usage(row):
+        actual = float(row["simulated_usage"])
+        theory = float(row["theory_usage"])
+        return actual if actual > 0 else theory
 
     merged["final_daily_usage"] = merged.apply(pick_usage, axis=1)
     merged["forecast"] = merged["final_daily_usage"] * hor
-    merged["order"] = (merged["forecast"] + merged["safety_stock"] - merged["current_stock"] - merged["incoming_units"]).apply(lambda x: x if x > 0 else 0)
     
-    # 컬럼명 정리해서 보여주기
-    res_display = merged[["name", "target_area", "current_stock", "daily_avg_usage", "theory_usage", "forecast", "order"]].copy()
-    res_display = res_display.rename(columns={
-        "daily_avg_usage": "実績/日",
-        "theory_usage": "理論/日",
-        "forecast": "予測需要"
-    }).sort_values("order", ascending=False)
-    
-    # 소수점 깔끔하게
-    res_display["実績/日"] = res_display["実績/日"].apply(lambda x: round(x, 1))
-    res_display["理論/日"] = res_display["理論/日"].apply(lambda x: round(x, 1))
-    res_display["予測需要"] = res_display["予測需要"].apply(lambda x: int(x))
-    
-    st.dataframe(safe_display(res_display), use_container_width=True)
-    st.caption("💡 実績/日: 過去の在庫記録から計算 / 理論/日: 稼働率設定 × 1室あたり個数")
+    # 필요 수량(낱개) 계산
+    merged["order_units"] = (merged["forecast"] + merged["safety_stock"] - merged["current_stock"] - merged["incoming_units"]).apply(lambda x: x if x > 0 else 0)
 
+    # [NEW] 낱개를 CS 단위로 변환하는 함수
+    def convert_to_cs(row):
+        units_needed = row["order_units"]
+        cs_size = row.get("cs_total_units", 0)
+        unit_name = row.get("unit", "")
+
+        if units_needed <= 0:
+            return "-" # 발주 필요 없음
+        
+        # CS 정보가 제대로 입력되어 있다면 CS로 계산
+        if cs_size > 0:
+            cs_count = units_needed / cs_size
+            # 소수점 1자리까지 표시 (예: 5.2 CS)
+            return f"{cs_count:.1f} CS"
+        else:
+            # CS 정보가 없으면 그냥 낱개로 표시
+            return f"{int(units_needed)} {unit_name}"
+
+    merged["order_display"] = merged.apply(convert_to_cs, axis=1)
+    
+    # 4. 화면 표시 (정렬은 낱개 수량 기준으로 내림차순)
+    res_display = merged.sort_values("order_units", ascending=False)
+    
+    # 보여줄 컬럼 선택
+    cols_to_show = ["name", "target_area", "current_stock", "final_daily_usage", "order_display"]
+    
+    # 컬럼명 깔끔하게 변경 (일본어)
+    res_display = res_display[cols_to_show].rename(columns={
+        "name": "品目名",
+        "target_area": "エリア",
+        "current_stock": "現在在庫",
+        "final_daily_usage": "予想消費/日",
+        "order_display": "発注推奨 (CS)"
+    })
+    
+    # 숫자 포맷 정리
+    res_display["予想消費/日"] = res_display["予想消費/日"].apply(lambda x: round(x, 1))
+    res_display["現在在庫"] = res_display["現在在庫"].apply(lambda x: int(x))
+
+    # 표 그리기
+    st.dataframe(safe_display(res_display), use_container_width=True)
+    
+    st.info("💡 '発注推奨 (CS)' は、必要数を1CS入数で割った値です。 (1CS入数が未登録の場合は単位で表示)")
 def page_calendar():
     st.header(t("cal_header"))
     t1, t2 = st.tabs([t("cal_tab_new"), t("cal_tab_list")])
@@ -689,3 +724,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
