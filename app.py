@@ -14,7 +14,6 @@ try:
 except:
     # 혹시 로컬에서 테스트할 때를 대비한 예비 코드 (필요하면 주석 처리)
     DB_URL = "postgresql://postgres.btlscfzrlwismefvyfea:Hakata190925@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres"
-
 # 일본 공휴일 데이터
 JAPAN_HOLIDAYS = {
     "2025-01-01": "元日", "2025-01-13": "成人の日", "2025-02-11": "建国記念の日",
@@ -36,6 +35,7 @@ TEXTS = {
         "dashboard_alert": "発注推奨品目数", "dashboard_incoming": "入荷待ち件数", "dashboard_total_items": "登録品目数",
         "items_header": "品目マスター管理", "items_new": "新規登録", "items_list": "登録済み一覧",
         "item_name": "品目名", "item_cat": "使用エリア", "unit": "単位", "safety": "安全在庫", 
+        "upr": "1室あたり使用数", # New!
         "cs_total": "1CS入数", "units_per_box": "1箱入数", "boxes_per_cs": "1CS箱数",
         "btn_register": "登録", "btn_update": "更新", "items_edit": "編集・削除", "select_item_edit": "品目選択",
         "err_itemname": "品目名は必須です。", "success_register": "登録しました。", "success_update": "更新しました。",
@@ -43,8 +43,9 @@ TEXTS = {
         "stock_select_item": "品目選択", "stock_date": "日付", "stock_cs": "CS", "stock_box": "箱/袋", "stock_note": "備考",
         "btn_save_stock": "保存", "success_save_stock": "保存しました。", "recent_stock": "最新在庫状況", "history_list": "最近の入力履歴（削除可能）", 
         "btn_delete": "削除", "select_delete": "削除する記録を選択", "success_delete": "削除しました。", "warn_no_data": "データがありません。",
-        "forecast_header": "在庫予測・発注シミュレーション", "days_label": "過去平均算出期間(日)", "horizon_label": "予測期間(日)",
-        "forecast_result": "発注推奨リスト", "info_forecast": "稼働率を変更して必要数をシミュレーションできます。",
+        "forecast_header": "ハイブリッド在庫予測 (実績 vs 理論)",
+        "days_label": "過去実績算出期間(日)", "horizon_label": "予測期間(日)",
+        "forecast_result": "発注推奨リスト", "info_forecast": "実際の消費量(Actual)と、稼働率ベースの理論値(Theory)を比較して多い方を採用します。",
         "cal_header": "入荷予定カレンダー", "cal_tab_new": "予定登録", "cal_tab_list": "カレンダー・検索・削除",
         "cal_item": "品目", "cal_order_date": "発注日", "cal_arrival_date": "入荷予定日", "cal_cs": "CS", "cal_box": "箱/袋", "cal_note": "備考",
         "btn_save_cal": "登録", "success_save_cal": "登録しました。", "cal_list": "入荷予定一覧", "cal_search_item": "品目検索",
@@ -67,13 +68,14 @@ def get_engine():
 def init_db():
     engine = get_engine()
     with engine.connect() as conn:
-        # 테이블 생성
+        # items 테이블 생성 (units_per_room 컬럼 추가)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS items (
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 target_area TEXT DEFAULT 'ALL',
                 unit TEXT,
+                units_per_room FLOAT DEFAULT 0.0,
                 cs_total_units INTEGER DEFAULT 0,
                 units_per_box INTEGER DEFAULT 0,
                 boxes_per_cs INTEGER DEFAULT 0,
@@ -81,12 +83,12 @@ def init_db():
             )
         """))
         
-        # [수정] IF NOT EXISTS 문법을 사용하여 에러 방지
+        # [자동 마이그레이션] 기존 테이블에 컬럼이 없으면 추가
         try:
             conn.execute(text("ALTER TABLE items ADD COLUMN IF NOT EXISTS target_area TEXT DEFAULT 'ALL'"))
+            conn.execute(text("ALTER TABLE items ADD COLUMN IF NOT EXISTS units_per_room FLOAT DEFAULT 0.0"))
             conn.commit()
         except Exception:
-            # 혹시라도 에러나면 무시 (이미 있을 확률 100%)
             pass
 
         conn.execute(text("""
@@ -146,22 +148,22 @@ def safe_display(df):
 @st.cache_data(ttl=60)
 def get_items_df():
     df = run_query("SELECT * FROM items ORDER BY id")
-    return force_numeric(df, ["cs_total_units", "units_per_box", "boxes_per_cs", "safety_stock"])
+    return force_numeric(df, ["cs_total_units", "units_per_box", "boxes_per_cs", "safety_stock", "units_per_room"])
 
-def add_item(name, area, unit, cs, upb, bpc, safe):
+def add_item(name, area, upr, unit, cs, upb, bpc, safe):
     sql = """
-    INSERT INTO items (name, target_area, unit, cs_total_units, units_per_box, boxes_per_cs, safety_stock)
-    VALUES (:name, :area, :unit, :cs, :upb, :bpc, :safe)
+    INSERT INTO items (name, target_area, units_per_room, unit, cs_total_units, units_per_box, boxes_per_cs, safety_stock)
+    VALUES (:name, :area, :upr, :unit, :cs, :upb, :bpc, :safe)
     """
-    run_query(sql, {"name": name, "area": area, "unit": unit, "cs": cs, "upb": upb, "bpc": bpc, "safe": safe})
+    run_query(sql, {"name": name, "area": area, "upr": upr, "unit": unit, "cs": cs, "upb": upb, "bpc": bpc, "safe": safe})
     get_items_df.clear()
 
-def update_item_logic(iid, name, area, unit, cs, upb, bpc, safe):
+def update_item_logic(iid, name, area, upr, unit, cs, upb, bpc, safe):
     sql = """
-    UPDATE items SET name=:name, target_area=:area, unit=:unit, cs_total_units=:cs, 
+    UPDATE items SET name=:name, target_area=:area, units_per_room=:upr, unit=:unit, cs_total_units=:cs, 
     units_per_box=:upb, boxes_per_cs=:bpc, safety_stock=:safe WHERE id=:id
     """
-    run_query(sql, {"name": name, "area": area, "unit": unit, "cs": cs, "upb": upb, "bpc": bpc, "safe": safe, "id": iid})
+    run_query(sql, {"name": name, "area": area, "upr": upr, "unit": unit, "cs": cs, "upb": upb, "bpc": bpc, "safe": safe, "id": iid})
     get_items_df.clear()
 
 def delete_item_logic(iid):
@@ -206,7 +208,7 @@ def get_latest_stock_df():
     LEFT JOIN LatestSnaps ls ON i.id = ls.item_id
     """
     df = run_query(sql)
-    return force_numeric(df, ["current_stock", "safety_stock", "cs_total_units", "units_per_box", "boxes_per_cs"])
+    return force_numeric(df, ["current_stock", "safety_stock", "cs_total_units", "units_per_box", "boxes_per_cs", "units_per_room"])
 
 def get_snapshot_history():
     sql = """
@@ -288,7 +290,6 @@ def page_home():
         merged["daily_avg_usage"] = 0.0
     
     merged["daily_avg_usage"] = pd.to_numeric(merged["daily_avg_usage"], errors='coerce').fillna(0)
-    merged["forecast_usage"] = merged["daily_avg_usage"] * horizon
     
     incoming_df = get_future_deliveries(horizon)
     if incoming_df is not None and not incoming_df.empty:
@@ -297,8 +298,59 @@ def page_home():
     else:
         merged["incoming_units"] = 0.0
     
+    # ==========================================
+    # [NEW] 예측 로직: 실제 사용량(Actual) vs 이론 사용량(Theory)
+    # ==========================================
+    
+    # 1. 기본 가동률 설정 (태홍이네 호텔 기준)
+    ROOMS_ALL = 238
+    ROOMS_STD = 225
+    ROOMS_HAK = 13
+    
+    OCC_ALL = 0.90 # 90%
+    OCC_STD = 0.93 # 93%
+    OCC_HAK = 0.70 # 70%
+
+    def calculate_theory_daily(row):
+        area = row.get("target_area", "ALL")
+        upr = float(row.get("units_per_room", 0.0)) # 1방당 몇개?
+        
+        if upr <= 0: return 0.0 # 설정 안했으면 계산 불가
+        
+        rooms = ROOMS_ALL
+        occ = OCC_ALL
+        
+        if area == "STD":
+            rooms = ROOMS_STD
+            occ = OCC_STD
+        elif area == "HAK":
+            rooms = ROOMS_HAK
+            occ = OCC_HAK
+            
+        # 이론상 하루 소비량 = 방개수 * 가동률 * 방당개수
+        return rooms * occ * upr
+
+    merged["theory_daily_usage"] = merged.apply(calculate_theory_daily, axis=1)
+    
+    # 2. 최종 예측량 결정 (실제 vs 이론 중 더 큰 값 or 상황에 따라 선택)
+    # 여기서는 안전하게 '둘 중 더 큰 값'을 기준으로 잡거나, 
+    # 실제 데이터가 없으면 이론값을 쓰는 하이브리드 방식 채택
+    def decide_forecast_usage(row):
+        actual = row["daily_avg_usage"]
+        theory = row["theory_daily_usage"]
+        
+        # 실제 기록이 있으면 그걸 우선하되, 이론값이 터무니없이 크면(도난 등) 이론값 참고 가능
+        # 여기선 단순하게: 실제 데이터가 0이면 이론값, 아니면 실제값 사용 (또는 MAX 사용)
+        if actual > 0:
+            return actual
+        else:
+            return theory
+
+    merged["final_daily_usage"] = merged.apply(decide_forecast_usage, axis=1)
+    merged["forecast"] = merged["final_daily_usage"] * horizon
+    
     merged["order_qty"] = (
-        merged["forecast_usage"] + merged["safety_stock"]
+        merged["forecast"] + merged["safety_stock"]
         - merged["current_stock"] - merged["incoming_units"]
     ).apply(lambda x: x if x > 0 else 0)
     
@@ -311,9 +363,23 @@ def page_home():
     
     st.divider()
     if not urgent.empty:
-        st.subheader("🚨 Urgent Orders")
-        urgent_display = urgent[["name", "target_area", "current_stock", "safety_stock", "order_qty", "unit"]].copy()
+        st.subheader("🚨 Urgent Orders (Recommended)")
+        # 표시용 데이터 생성
+        urgent_display = urgent[["name", "target_area", "current_stock", "daily_avg_usage", "theory_daily_usage", "order_qty", "unit"]].copy()
+        
+        # 컬럼명 보기 좋게 변경 (일본어)
+        urgent_display = urgent_display.rename(columns={
+            "daily_avg_usage": "実績消費/日",
+            "theory_daily_usage": "理論消費/日"
+        })
+        
+        # 소수점 정리
+        urgent_display["実績消費/日"] = urgent_display["実績消費/日"].apply(lambda x: round(x, 1))
+        urgent_display["理論消費/日"] = urgent_display["理論消費/日"].apply(lambda x: round(x, 1))
+        urgent_display["order_qty"] = urgent_display["order_qty"].apply(lambda x: int(x))
+
         st.dataframe(safe_display(urgent_display).style.background_gradient(cmap="Reds", subset=["order_qty"]), use_container_width=True)
+        st.caption("※ 実績消費: 過去の在庫記録に基づく平均 / 理論消費: 稼働率設定に基づく計算値")
     else:
         st.success("✅ All stocks are safe.")
 
@@ -339,8 +405,12 @@ def page_items():
                 with st.form("edit_item"):
                     c1, c2 = st.columns(2)
                     n = c1.text_input(t("item_name"), row["name"])
+                    
                     curr_area = row["target_area"] if row["target_area"] in AREA_OPTS else "ALL"
                     area_key = c1.selectbox(t("item_cat"), list(AREA_OPTS.keys()), index=list(AREA_OPTS.keys()).index(curr_area), format_func=lambda x: AREA_OPTS[x])
+                    
+                    # [NEW] 1실당 사용수 입력
+                    upr = c1.number_input(t("upr"), 0.0, value=float(row.get("units_per_room", 0.0)), step=0.1)
                     
                     u = c1.text_input(t("unit"), row["unit"])
                     s = c1.number_input(t("safety"), 0, value=int(row["safety_stock"]))
@@ -349,7 +419,7 @@ def page_items():
                     bp = c2.number_input(t("boxes_per_cs"), 0, value=int(row["boxes_per_cs"]))
                     
                     if st.form_submit_button(t("btn_update")):
-                        update_item_logic(iid, n, area_key, u, ct, up, bp, s)
+                        update_item_logic(iid, n, area_key, upr, u, ct, up, bp, s)
                         st.toast(t("success_update"), icon="✅")
                         st.rerun()
                 
@@ -367,6 +437,10 @@ def page_items():
             c1, c2 = st.columns(2)
             n = c1.text_input(t("item_name"))
             area_key = c1.selectbox(t("item_cat"), list(AREA_OPTS.keys()), format_func=lambda x: AREA_OPTS[x])
+            
+            # [NEW] 1실당 사용수 입력
+            upr = c1.number_input(t("upr"), 0.0, step=0.1)
+            
             u = c1.text_input(t("unit"), "本")
             s = c1.number_input(t("safety"), 0)
             ct = c2.number_input(t("cs_total"), 0)
@@ -374,7 +448,7 @@ def page_items():
             bp = c2.number_input(t("boxes_per_cs"), 0)
             if st.form_submit_button(t("btn_register")):
                 if n:
-                    add_item(n, area_key, u, ct, up, bp, s)
+                    add_item(n, area_key, upr, u, ct, up, bp, s)
                     st.toast(t("success_register"), icon="🎉")
                     st.rerun()
                 else:
@@ -436,9 +510,10 @@ def page_forecast_general():
 
     with st.expander("⚙️ 稼働率設定 (Occupancy Settings)", expanded=True):
         c1, c2, c3 = st.columns(3)
-        occ_all = c1.slider("全客室 (Default 90%)", 0, 100, 90)
-        occ_std = c2.slider("Standard (Default 93%)", 0, 100, 93)
-        occ_hak = c3.slider("Hakata (Default 70%)", 0, 100, 70)
+        # [태홍이 호텔 기준 가동률]
+        occ_all = c1.slider("全客室 (Default 90%)", 0, 100, 90) / 100.0
+        occ_std = c2.slider("Standard (Default 93%)", 0, 100, 93) / 100.0
+        occ_hak = c3.slider("Hakata (Default 70%)", 0, 100, 70) / 100.0
         
         cc1, cc2 = st.columns(2)
         days = cc1.slider(t("days_label"), 7, 120, 60)
@@ -458,28 +533,59 @@ def page_forecast_general():
     else:
         merged["incoming_units"] = 0.0
 
-    def apply_occupancy_rate(row):
-        base_usage = float(row["daily_avg_usage"])
+    # [핵심 로직] 가동률 기반 시뮬레이션 (Theory Calculation)
+    ROOMS_ALL = 238
+    ROOMS_STD = 225
+    ROOMS_HAK = 13
+
+    def calculate_simulated_daily(row):
         area = row.get("target_area", "ALL")
-        ref_occ = 90.0 
-        target_occ = occ_all
-
-        if area == "STD":
-            ref_occ = 93.0
-            target_occ = occ_std
-        elif area == "HAK":
-            ref_occ = 70.0
-            target_occ = occ_hak
+        upr = float(row.get("units_per_room", 0.0)) # 방당 개수
         
-        factor = target_occ / ref_occ if ref_occ > 0 else 1.0
-        return base_usage * factor
+        # 설정 안 했으면 그냥 0 리턴
+        if upr <= 0: return 0.0
+        
+        # 이론 사용량 = 객실수 * 현재설정가동률 * 방당개수
+        if area == "STD":
+            return ROOMS_STD * occ_std * upr
+        elif area == "HAK":
+            return ROOMS_HAK * occ_hak * upr
+        else:
+            return ROOMS_ALL * occ_all * upr
 
-    merged["simulated_usage"] = merged.apply(apply_occupancy_rate, axis=1)
-    merged["forecast"] = merged["simulated_usage"] * hor
+    merged["theory_usage"] = merged.apply(calculate_simulated_daily, axis=1)
+    
+    # [하이브리드] 실제 vs 이론 중 무엇을 쓸 것인가?
+    # -> 실제 데이터가 있으면 실제를 쓰고, 없으면 이론을 쓴다.
+    # -> (원한다면 MAX(실제, 이론)으로 바꿀 수도 있음)
+    def pick_usage(row):
+        actual = float(row["daily_avg_usage"])
+        theory = float(row["theory_usage"])
+        
+        # Case 1: 실제 데이터가 충분하면 실제 데이터가 짱임
+        if actual > 0: return actual
+        # Case 2: 실제 데이터 없으면(신상품 등) 이론치 사용
+        return theory
+
+    merged["final_daily_usage"] = merged.apply(pick_usage, axis=1)
+    merged["forecast"] = merged["final_daily_usage"] * hor
     merged["order"] = (merged["forecast"] + merged["safety_stock"] - merged["current_stock"] - merged["incoming_units"]).apply(lambda x: x if x > 0 else 0)
     
-    res_display = merged[["name", "target_area", "current_stock", "incoming_units", "forecast", "safety_stock", "order"]].sort_values("order", ascending=False)
+    # 컬럼명 정리해서 보여주기
+    res_display = merged[["name", "target_area", "current_stock", "daily_avg_usage", "theory_usage", "forecast", "order"]].copy()
+    res_display = res_display.rename(columns={
+        "daily_avg_usage": "実績/日",
+        "theory_usage": "理論/日",
+        "forecast": "予測需要"
+    }).sort_values("order", ascending=False)
+    
+    # 소수점 깔끔하게
+    res_display["実績/日"] = res_display["実績/日"].apply(lambda x: round(x, 1))
+    res_display["理論/日"] = res_display["理論/日"].apply(lambda x: round(x, 1))
+    res_display["予測需要"] = res_display["予測需要"].apply(lambda x: int(x))
+    
     st.dataframe(safe_display(res_display), use_container_width=True)
+    st.caption("💡 実績/日: 過去の在庫記録から計算 / 理論/日: 稼働率設定 × 1室あたり個数")
 
 def page_calendar():
     st.header(t("cal_header"))
